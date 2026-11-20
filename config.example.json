@@ -1,0 +1,50 @@
+{
+  "telegram_token": "",
+  "telegram_chat_id": "",
+  "window_title_regex": "TEMS Discovery.*",
+  "poll_seconds": 3,
+  "window_missing_polls": 5,
+  "display_name": "",
+  "sender_title": "Temsy",
+  "batch_settle_seconds": 5,
+  "verify_ssl": true,
+  "ca_bundle": "",
+  "channel": "whatsapp",
+  "use_ocr": true,
+  "msg_style": "letter",
+  "msg_start": "Tems Discovery start Loading Log Files",
+  "msg_finish": "Finish. File Loading",
+  "motivation": {
+    "enabled": true,
+    "every_hours": 2,
+    "provider": "openrouter",
+    "model": "openai/gpt-4o-mini",
+    "env_file": ".env",
+    "api_key": "",
+    "base_url": ""
+  },
+  "autostart": {
+    "process_names": ["DiscoveryCore.exe"],
+    "poll_seconds": 3,
+    "stop_with_tems": true,
+    "python": ""
+  },
+  "remote": {
+    "enabled": true,
+    "poll_seconds": 20,
+    "root": "",
+    "page_size": 18,
+    "max_files": 100,
+    "dataset": "",
+    "allowed_phones": []
+  },
+  "whatsapp": {
+    "provider": "greenapi",
+    "phone": "",
+    "id_instance": "",
+    "api_token": "",
+    "api_url": "",
+    "fallback_api_url": "https://api.greenapi.com",
+    "chat_id": ""
+  }
+}

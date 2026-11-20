@@ -1,0 +1,21 @@
+# Local secrets and configuration
+config.json
+.env
+
+# Generated runtime files
+*.log
+motivation_last.json
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+.pytest_cache/
+
+# Editors / OS
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
