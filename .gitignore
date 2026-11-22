@@ -5,6 +5,7 @@ config.json
 # Generated runtime files
 *.log
 motivation_last.json
+imported.json
 
 # Python
 __pycache__/

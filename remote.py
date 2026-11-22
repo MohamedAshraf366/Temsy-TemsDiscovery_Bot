@@ -2,7 +2,8 @@
 WhatsApp remote control for TEMS Discovery (GREEN-API).
 
 Commands (send them in the WhatsApp chat linked to the bot):
-    /start              start browsing from "This PC"
+    /start              browse from "This PC" (+ new logs found automatically)
+    /recent             only the newest log folders found automatically
     1, 2, ...           open the numbered folder / select the numbered file
     ..  or /up          go up one level
     /next, /prev        next / previous page
@@ -16,9 +17,13 @@ Commands (send them in the WhatsApp chat linked to the bot):
 The import drives the real TEMS UI (Import Drive Test Data dialog), i.e. the
 same steps shown in the reference video. Nothing is imported until /yes.
 """
+import json
 import logging
+import os
 import re
+import sys
 import time
+from datetime import datetime
 from pathlib import Path
 
 import requests
@@ -33,6 +38,7 @@ log = logging.getLogger("tems-remote")
 
 _STATE = None
 _FAILS = 0
+_LAST_QUOTA = 0.0
 
 
 def _digits(value):
@@ -80,6 +86,102 @@ def _drives():
     return result
 
 
+def _state_file():
+    return Path(getattr(monitor, "BASE", Path(__file__).resolve().parent)) / "imported.json"
+
+
+def _file_key(path, size, mtime):
+    return f"{str(path).lower()}|{size}|{int(mtime)}"
+
+
+def _load_imported():
+    try:
+        return set(json.loads(_state_file().read_text(encoding="utf-8")))
+    except Exception:
+        return set()
+
+
+def _mark_imported(files):
+    keys = _load_imported()
+    for f in files:
+        try:
+            st = Path(f).stat()
+            keys.add(_file_key(f, st.st_size, st.st_mtime))
+        except OSError:
+            pass
+    try:
+        _state_file().write_text(json.dumps(sorted(keys)), encoding="utf-8")
+    except Exception as e:
+        log.warning("Cannot save imported.json: %s", e)
+
+
+_SKIP_DIRS = {"windows", "program files", "program files (x86)", "programdata", "appdata",
+              "$recycle.bin", "system volume information", "node_modules", ".git",
+              "__pycache__", "site-packages"}
+
+
+def _scan_recent(remote_cfg, now=None):
+    """Find folders holding .trp files that are recent and not imported yet.
+
+    Returns [(Path, new_file_count, newest_mtime)], newest first.
+    """
+    now = now or time.time()
+    home = Path.home()
+    roots = list(remote_cfg.get("search_roots") or [])
+    if not roots:
+        roots = [remote_cfg.get("root", r"D:\WORK"), home / "Desktop", home / "Downloads",
+                 home / "Documents"]
+    days = float(remote_cfg.get("recent_days", 7))
+    max_depth = int(remote_cfg.get("scan_depth", 4))
+    limit = int(remote_cfg.get("recent_count", 3))
+    deadline = now + float(remote_cfg.get("scan_seconds", 8))
+    imported = _load_imported()
+    found = {}
+
+    def walk(folder, depth):
+        if time.time() > deadline:
+            return
+        try:
+            entries = list(os.scandir(folder))
+        except OSError:
+            return
+        for e in entries:
+            try:
+                if e.is_dir(follow_symlinks=False):
+                    if depth < max_depth and e.name.lower() not in _SKIP_DIRS \
+                            and not e.name.startswith("."):
+                        walk(e.path, depth + 1)
+                elif e.name.lower().endswith(".trp") and e.is_file(follow_symlinks=False):
+                    st = e.stat()
+                    if days and now - st.st_mtime > days * 86400:
+                        continue
+                    if _file_key(e.path, st.st_size, st.st_mtime) in imported:
+                        continue
+                    count, newest = found.get(folder, (0, 0))
+                    found[folder] = (count + 1, max(newest, st.st_mtime))
+            except OSError:
+                continue
+
+    seen = set()
+    for r in roots:
+        r = Path(r)
+        if str(r).lower() in seen:
+            continue
+        seen.add(str(r).lower())
+        try:
+            if r.exists():
+                walk(str(r), 0)
+        except OSError:
+            pass
+    ranked = sorted(found.items(), key=lambda kv: kv[1][1], reverse=True)[:limit]
+    return [(Path(folder), count, newest) for folder, (count, newest) in ranked]
+
+
+def _mask_chat(chat):
+    d = _digits(chat)
+    return f"...{d[-4:]}" if len(d) > 4 else d
+
+
 def _entries(folder, max_files=60):
     """[(kind, path)] - folders first, then .trp files."""
     dirs, files = [], []
@@ -117,6 +219,7 @@ class Session:
         self.project = ""
         self.dataset = str(self.remote.get("dataset", "") or "")
         self._reply_chat = None
+        self.recent_info = {}
 
     # ------------------------------------------------------------ messaging
     def say(self, text):
@@ -143,13 +246,15 @@ class Session:
         self.mode = self.path = None
         self.entries, self.files, self.page = [], [], 0
         self.import_limit = 0
+        self.recent_info = {}
         self.project = ""
         self.dataset = str(self.remote.get("dataset", "") or "")
 
     def help(self):
         self.say(
             "🤖 أوامر Temsy:\n"
-            "/start - ابدأ التصفح من This PC\n"
+            "/start - ابدأ التصفح من This PC (+ أحدث لوجات لقيتها)\n"
+            "/recent - أحدث فولدرات فيها لوجات جديدة بس\n"
             "رقم - افتح المجلد / اختر الملف\n"
             ".. للرجوع • /next • /prev\n"
             "/yes تأكيد الاستيراد • /all كل الملفات • /all 20 آخر 20 ملف\n"
@@ -165,10 +270,17 @@ class Session:
         chunk = self.entries[start:start + page_size]
         lines = [f"📂 {title}"]
         for i, (kind, p) in enumerate(chunk, start + 1):
+            if kind == "recent":
+                count, newest = self.recent_info.get(str(p), (0, 0))
+                when = datetime.fromtimestamp(newest).strftime("%d %b %H:%M") if newest else ""
+                lines.append(f"{i}) ⭐ {p} — {count} جديد {when}".rstrip())
+                continue
             label = str(p) if (kind == "dir" and p.parent == p) else p.name
             lines.append(f"{i}) {'📁' if kind == 'dir' else '📄'} {label}")
         if not chunk:
             lines.append("(فاضي)")
+        if any(k == "recent" for k, _ in chunk):
+            lines.append("⭐ = لوجات جديدة لقيتها أوتوماتيك (لسه ما اتعملهاش import)")
         if len(self.entries) > start + page_size:
             lines.append("/next للصفحة التالية")
         if self.page:
@@ -187,7 +299,29 @@ class Session:
     def home(self):
         self.reset()
         self.mode = "browse"
-        self.entries = [("dir", p) for p in _drives()]
+        try:
+            recents = _scan_recent(self.remote)
+        except Exception as e:
+            log.warning("Recent scan failed: %s", e)
+            recents = []
+        self.recent_info = {str(p): (n, t) for p, n, t in recents}
+        self.entries = [("dir", p) for p in _drives()] + [("recent", p) for p, _, _ in recents]
+        self.listing()
+
+    def recent(self):
+        self.reset()
+        self.mode = "browse"
+        try:
+            recents = _scan_recent(self.remote)
+        except Exception as e:
+            log.warning("Recent scan failed: %s", e)
+            recents = []
+        if not recents:
+            self.say("🔎 مالقيتش لوجات .trp جديدة. اكتب /start وتصفح بنفسك.")
+            self.reset()
+            return
+        self.recent_info = {str(p): (n, t) for p, n, t in recents}
+        self.entries = [("recent", p) for p, _, _ in recents]
         self.listing()
 
     def up(self):
@@ -196,6 +330,9 @@ class Session:
             return
         parent = self.path.parent
         self.path = parent if str(parent) != str(self.path) else None
+        if self.path is None:
+            self.home()
+            return
         self.page = 0
         self.entries = [("dir", p) for p in _drives()] if self.path is None else _entries(
             self.path, int(self.remote.get("page_size", 18)) + int(self.remote.get("max_files", 60))
@@ -223,7 +360,7 @@ class Session:
     def by_name(self, text):
         wanted = text.strip().lower().rstrip("\\:")
         for kind, p in self.entries:
-            label = str(p) if kind == "dir" and p.parent == p else p.name
+            label = str(p) if (kind == "recent" or (kind == "dir" and p.parent == p)) else p.name
             if label.lower().rstrip("\\:") == wanted:
                 return kind, p
         return None
@@ -237,7 +374,7 @@ class Session:
             self.say("اختيار غير صحيح")
             return
         kind, target = self.entries[pos]
-        if kind == "dir":
+        if kind in ("dir", "recent"):
             self.open(target)
         else:
             self.files = [target]
@@ -325,6 +462,7 @@ class Session:
             return
         try:
             perform_import(self.cfg, files, self.infer_project(), self.dataset)
+            _mark_imported(files)
             self.say(f"🚀 بدأ الاستيراد: {len(files)} ملف. Temsy تحت أمرك يا قائد 👑")
         except Exception as e:
             log.exception("Import error: %s", e)
@@ -343,7 +481,7 @@ class Session:
                 picked = self.by_name(t)
                 if picked:
                     kind, target = picked
-                    if kind == "dir":
+                    if kind in ("dir", "recent"):
                         self.open(target)
                     else:
                         self.files = [target]
@@ -357,6 +495,8 @@ class Session:
             self.help()
         elif low in ("/status",):
             self.status()
+        elif low in ("/recent", "/حديث"):
+            self.recent()
         elif low in ("/cancel", "/الغاء"):
             self.reset()
             self.say("تم الإلغاء يا قائد")
@@ -447,6 +587,73 @@ def _message_text(body):
     return ""
 
 
+def _on_quota(cfg, body):
+    """GREEN-API free plan allows 3 chats per month; explain it once an hour."""
+    global _LAST_QUOTA
+    if time.time() - _LAST_QUOTA < 3600:
+        return
+    _LAST_QUOTA = time.time()
+    data = body.get("quotaData", {}) or {}
+    desc = str(data.get("description", ""))
+    allowed_chats = re.findall(r"\d{8,}@c\.us", desc)
+    mine = _digits((cfg.get("whatsapp", {}) or {}).get("phone"))
+    listed = ", ".join(_mask_chat(c) for c in allowed_chats) or "unknown"
+    ok = any(_digits(c) == mine for c in allowed_chats) if allowed_chats else None
+    log.warning("GREEN-API Developer plan quota reached (%s/%s chats). Allowed chats: %s. "
+                "Your number allowed: %s", data.get("used"), data.get("total"), listed, ok)
+    text = ("⚠️ GREEN-API free plan: monthly limit of 3 chats reached. Messages from other chats "
+            "are not delivered until the quota resets (or the plan is upgraded).\n"
+            f"Allowed chats: {listed}\n"
+            + ("Your number is NOT among them, so WhatsApp commands will not arrive.\n" if ok is False else "")
+            + "Run: python remote.py --green-check")
+    token = str(cfg.get("telegram_token", ""))
+    if token and "PUT_" not in token and hasattr(monitor, "send_telegram"):
+        try:
+            monitor.send_telegram(cfg, text)
+        except Exception as e:
+            log.warning("Quota alert via Telegram failed: %s", e)
+
+
+def _handle_notification(cfg, remote_cfg, body, kind, stale):
+    if kind == "quotaExceeded":
+        _on_quota(cfg, body)
+        return
+    # Only real chat messages. This also drops outgoingAPIMessageReceived,
+    # i.e. our own replies, so they can never be treated as commands.
+    if kind not in ("incomingMessageReceived", "outgoingMessageReceived"):
+        log.debug("Ignored notification type %s", kind)
+        return
+    ts = body.get("timestamp")
+    if ts:
+        age = time.time() - float(ts)
+        if age > stale:
+            log.info("Ignored stale %s (%d s old)", kind, age)
+            return
+    text = (_message_text(body) or "").strip()
+    if not text or len(text) > 160:
+        return
+    sender = body.get("senderData", {}) or {}
+    chat = str(sender.get("chatId") or "")
+    allowed = set(filter(None, [
+        _digits((cfg.get("whatsapp", {}) or {}).get("phone")),
+        *[_digits(x) for x in (remote_cfg.get("allowed_phones") or [])],
+    ]))
+    # Commands are accepted ONLY inside a private chat with an allowed number.
+    # (Never in groups, and never in someone else's chat just because the
+    # sender happens to be you.)
+    if not allowed or not chat.endswith("@c.us") or _digits(chat) not in allowed:
+        if text.startswith("/"):
+            log.warning("Ignored command from chat %s (not an allowed private chat)", _mask_chat(chat))
+        return
+    if kind == "outgoingMessageReceived":
+        # Typed on the linked phone (the self-chat): explicit commands only.
+        if not (text.startswith("/") or re.fullmatch(r"\d{1,3}|\.\.", text)):
+            return
+    log.info("Remote command [%s]: %s", kind, text[:80])
+    _STATE._reply_chat = chat
+    _STATE.handle(text)
+
+
 def poll(cfg):
     global _STATE, _FAILS
     remote_cfg = cfg.get("remote", {}) or {}
@@ -458,6 +665,7 @@ def poll(cfg):
     if time.time() - _STATE.last_poll < interval:
         return
     _STATE.last_poll = time.time()
+    stale = float(remote_cfg.get("stale_seconds", 180))
     try:
         for _ in range(10):
             notification = _receive(cfg)
@@ -466,47 +674,22 @@ def poll(cfg):
             receipt = notification.get("receiptId")
             body = notification.get("body", {}) or {}
             kind = body.get("typeWebhook", "?")
-            log.info("Notification received: %s", kind)
             try:
-                text = (_message_text(body) or "").strip()
-                if not text:
-                    log.info("Notification has no text: %s", (body.get("messageData") or {}).get("typeMessage"))
-                    continue
-                sender = body.get("senderData", {}) or {}
-                log.info("Incoming text [%s] from %s: %s", kind,
-                         sender.get("sender"), text[:120])
-                # Our own API replies must never be treated as commands.
-                if kind == "outgoingAPIMessageReceived":
-                    continue
-                if kind == "outgoingMessageReceived":
-                    # Typed on the linked phone (often the self-chat). Accept
-                    # only explicit commands so normal chatter is ignored.
-                    if not (text.startswith("/") or re.fullmatch(r"\d{1,3}|\.\.", text)):
-                        continue
-                # Incoming messages from the whitelisted sender may also name
-                # a folder (e.g. "WORK"), so short free text is allowed.
-                if len(text) > 160:
-                    continue
-                sender = body.get("senderData", {}) or {}
-                allowed = set(filter(None, [
-                    _digits(_STATE.phone),
-                    *[_digits(x) for x in (remote_cfg.get("allowed_phones") or [])],
-                ]))
-                who = {_digits(sender.get("sender")), _digits(sender.get("chatId"))}
-                if allowed and not (who & allowed):
-                    log.warning("Ignored command from %s: %s", who, text[:80])
-                    continue
-                _STATE._reply_chat = sender.get("chatId") or sender.get("sender") or None
-                log.info("Remote command [%s]: %s", body.get("typeWebhook", ""), text[:80])
-                _STATE.handle(text)
+                _handle_notification(cfg, remote_cfg, body, kind, stale)
             finally:
                 _delete(cfg, receipt)
     except Exception as e:
         _FAILS += 1
         if _FAILS == 1 or _FAILS % 10 == 0:
-            log.warning("Remote poll error (%d in a row): %s", _FAILS, e)
+            log.warning("Remote poll error (%d in a row): %s", _FAILS, _mask_secret(cfg, e))
     else:
         _FAILS = 0
+
+
+def _mask_secret(cfg, value):
+    token = str((cfg.get("whatsapp", {}) or {}).get("api_token", ""))
+    text = str(value)
+    return text.replace(token, "***") if token else text
 
 
 # ------------------------------------------------------------- import steps
@@ -587,3 +770,61 @@ def perform_import(cfg, files, project="", dataset="", dry_run=False):
         for h in opened:
             if win32gui.IsWindow(h):
                 _close(h)
+
+
+# --------------------------------------------------------------- diagnostics
+def green_check(cfg, fix=False):
+    """python remote.py --green-check [--fix]: inspect the GREEN-API instance."""
+    phone = _digits((cfg.get("whatsapp", {}) or {}).get("phone"))
+
+    def call(method, endpoint, payload=None):
+        r = _request(cfg, method, endpoint, payload=payload, timeout=25)
+        if r is None:
+            print("GREEN-API is not configured (whatsapp.id_instance / api_token / api_url).")
+            return None
+        try:
+            return r.status_code, r.json()
+        except Exception:
+            return r.status_code, r.text[:200]
+
+    state = call("get", "getStateInstance")
+    settings = call("get", "getSettings")
+    if not state or not settings:
+        return
+    print("Instance state :", state[1])
+    s = settings[1] if isinstance(settings[1], dict) else {}
+    wid = str(s.get("wid", ""))
+    for key in ("incomingWebhook", "outgoingMessageWebhook", "outgoingAPIMessageWebhook",
+                "outgoingWebhook", "stateWebhook"):
+        print(f"{key:27}:", s.get(key))
+    self_mode = bool(wid) and _digits(wid) == phone
+    print("Linked account  : ...%s   | whatsapp.phone: ...%s" % (_digits(wid)[-4:], phone[-4:]))
+    if self_mode:
+        print("Mode: SELF-CHAT. The linked WhatsApp is your own number; type commands in 'Message yourself'.")
+        wanted = {"incomingWebhook": "no", "outgoingMessageWebhook": "yes",
+                  "outgoingAPIMessageWebhook": "no", "outgoingWebhook": "no", "stateWebhook": "yes"}
+        print("Recommended: incomingWebhook=no, so your other chats stop using the free 3-chat quota.")
+    else:
+        print("Mode: BOT ACCOUNT. You message the linked number from your own phone.")
+        wanted = {"incomingWebhook": "yes", "outgoingMessageWebhook": "no",
+                  "outgoingAPIMessageWebhook": "no", "outgoingWebhook": "no", "stateWebhook": "yes"}
+    diff = {k: v for k, v in wanted.items() if str(s.get(k)).lower() != v}
+    if not diff:
+        print("Settings already match the recommendation.")
+        return
+    print("Differences    :", diff)
+    if not fix:
+        print("Run again with --fix to apply them (takes up to ~5 minutes to take effect).")
+        return
+    print("setSettings    :", call("post", "setSettings", payload=wanted))
+    print("Applied. Wait a few minutes, then restart monitor.py.")
+
+
+if __name__ == "__main__":
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    if "--green-check" in sys.argv:
+        green_check(monitor.load_config(), fix="--fix" in sys.argv)
+    else:
+        print(__doc__)

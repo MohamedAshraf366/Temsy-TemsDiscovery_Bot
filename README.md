@@ -91,6 +91,7 @@ monitor.py  ──────────────►  TEMS Discovery
 | `monitor.log` | Monitor runtime log (generated). |
 | `autostart.log` | Watcher runtime log (generated). |
 | `motivation_last.json` | Timestamp of the last motivation message (generated). |
+| `imported.json` | File keys already imported by `/recent` (generated, ignored). |
 
 ---
 
@@ -243,6 +244,12 @@ If no key is configured, a built-in local message list is used.
 | `remote.max_files` | number | Maximum files imported by `/all`. Default: `100`. |
 | `remote.dataset` | string | Default target dataset. Empty = leave TEMS value unchanged. |
 | `remote.allowed_phones` | array | Extra allowed sender numbers (digits only). `whatsapp.phone` is always allowed. |
+| `remote.search_roots` | array | Extra roots for the automatic recent-log scan. Empty = `remote.root`, Desktop, Downloads, Documents. |
+| `remote.recent_days` | number | Only `.trp` files newer than this many days are "recent". Default: `7`. |
+| `remote.scan_depth` | number | Maximum folder depth for the scan. Default: `4`. |
+| `remote.recent_count` | number | How many recent folders `/start` / `/recent` show. Default: `3`. |
+| `remote.scan_seconds` | number | Time budget for the scan. Default: `8`. |
+| `remote.stale_seconds` | number | Ignore notifications older than this. Default: `180`. |
 
 ### WhatsApp
 
@@ -330,6 +337,7 @@ pythonw monitor.py
 | `python monitor.py --motivate` | Generate and send one motivation message. |
 | `python monitor.py --chatid` | Print chat IDs that messaged your Telegram bot. |
 | `python autostart.py --status` | Show TEMS PIDs, monitor state, and watcher state. |
+| `python remote.py --green-check` | Inspect the GREEN-API instance state/settings and linked WhatsApp mode. Add `--fix` to apply the recommended settings. |
 
 The monitor refuses to start twice; only one instance per Windows session is allowed.
 
@@ -341,7 +349,8 @@ Send these messages in the WhatsApp chat linked to the bot:
 
 | Command | Action |
 |---|---|
-| `/start` | Begin browsing from **This PC**. |
+| `/start` | Begin browsing from **This PC**; also lists newly found `.trp` folders as ⭐. |
+| `/recent` | Show only folders with new, not-yet-imported `.trp` files. |
 | `1`, `2`, … | Open the numbered folder or select the numbered file. |
 | A folder name (e.g. `WORK`) | Open that folder by name. |
 | `..` or `/up` | Go up one level. |
@@ -492,6 +501,7 @@ The GREEN-API **Developer** plan has request/message limits. Constant polling co
 
 - Keep `remote.poll_seconds` at `20` or higher.
 - Do not run multiple monitor instances.
+- The free plan allows only **3 chats per month**; commands from other chats stop arriving when the limit is hit. `python remote.py --green-check` shows which chats are currently allowed.
 - Upgrade the GREEN-API plan or reduce notification volume.
 
 ### `Remote poll error ... ConnectTimeout` / `ReadTimeout`
@@ -572,6 +582,7 @@ config.json
 __pycache__/
 *.pyc
 motivation_last.json
+imported.json
 .venv/
 ```
 

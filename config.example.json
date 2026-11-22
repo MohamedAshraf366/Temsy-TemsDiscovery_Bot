@@ -36,7 +36,13 @@
     "page_size": 18,
     "max_files": 100,
     "dataset": "",
-    "allowed_phones": []
+    "allowed_phones": [],
+    "search_roots": [],
+    "recent_days": 7,
+    "scan_depth": 4,
+    "recent_count": 3,
+    "scan_seconds": 8,
+    "stale_seconds": 180
   },
   "whatsapp": {
     "provider": "greenapi",
